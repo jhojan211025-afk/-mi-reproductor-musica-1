@@ -392,10 +392,92 @@ let isLiked=false;
 let audioEl=document.getElementById('audioPlayer');
 let videoEl=document.getElementById('videoPlayer');
 let audioCtx,analyser,source,eqFilters=[];
+let db;
 
 const coverColors=['gc1','gc2','gc3','gc4','gc5','gc6','gc7','gc8','gc9','gc10'];
 const coverIcons=['🎵','🎸','🎹','🥁','🎺','🎷','🎶','🎤','🎧','🪕'];
 
+// ===== IndexedDB =====
+function openDB(){
+  return new Promise((resolve,reject)=>{
+    const req=indexedDB.open('MediaProDB',2);
+    req.onupgradeneeded=e=>{
+      const d=e.target.result;
+      if(!d.objectStoreNames.contains('tracks')){
+        const store=d.createObjectStore('tracks',{keyPath:'id',autoIncrement:true});
+        store.createIndex('name','name',{unique:false});
+      }
+    };
+    req.onsuccess=e=>{db=e.target.result;resolve(db)};
+    req.onerror=e=>reject(e);
+  });
+}
+
+function saveTrack(file,type){
+  return new Promise((resolve,reject)=>{
+    const reader=new FileReader();
+    reader.onload=()=>{
+      const tx=db.transaction('tracks','readwrite');
+      const store=tx.objectStore('tracks');
+      store.add({
+        name:file.name,
+        type:type,
+        data:reader.result,
+        size:file.size,
+        dateAdded:Date.now()
+      });
+      tx.oncomplete=()=>resolve();
+      tx.onerror=e=>reject(e);
+    };
+    reader.readAsArrayBuffer(file);
+  });
+}
+
+function getAllTracks(){
+  return new Promise((resolve,reject)=>{
+    const tx=db.transaction('tracks','readonly');
+    const store=tx.objectStore('tracks');
+    const req=store.getAll();
+    req.onsuccess=()=>resolve(req.result);
+    req.onerror=e=>reject(e);
+  });
+}
+
+function deleteTrack(id){
+  return new Promise((resolve,reject)=>{
+    const tx=db.transaction('tracks','readwrite');
+    const store=tx.objectStore('tracks');
+    store.delete(id);
+    tx.oncomplete=()=>resolve();
+    tx.onerror=e=>reject(e);
+  });
+}
+
+async function loadSavedTracks(){
+  const tracks=await getAllTracks();
+  playlist=[];
+  tracks.forEach(t=>{
+    const blob=new Blob([t.data]);
+    const url=URL.createObjectURL(blob);
+    const colorIdx=playlist.length%coverColors.length;
+    const iconIdx=playlist.length%coverIcons.length;
+    playlist.push({
+      id:t.id,
+      name:t.name,
+      url:url,
+      type:t.type,
+      duration:'--:--',
+      color:coverColors[colorIdx],
+      icon:coverIcons[iconIdx]
+    });
+  });
+  playlist.forEach((_,i)=>loadMeta(i));
+  updateUI();
+  generatePlaylists();
+  if(currentIndex===-1&&playlist.length>0) selectTrack(0);
+}
+
+// ===== Core =====
 function getGreeting(){
   const h=new Date().getHours();
   if(h<6)return'Buenas noches';
@@ -421,20 +503,18 @@ function switchView(v,el){
   if(v==='library') updateLibraryView();
 }
 
-function handleFiles(e,type){
+async function handleFiles(e,type){
   const files=Array.from(e.target.files);
-  files.forEach(f=>{
-    const url=URL.createObjectURL(f);
-    playlist.push({name:f.name,url,type,duration:'--:--',color:coverColors[playlist.length%coverColors.length],icon:coverIcons[playlist.length%coverIcons.length]});
-    loadMeta(playlist.length-1);
-  });
-  updateUI();
-  generatePlaylists();
+  for(const f of files){
+    await saveTrack(f,type);
+  }
+  await loadSavedTracks();
   if(currentIndex===-1&&playlist.length>0) selectTrack(0);
 }
 
 function loadMeta(idx){
   const item=playlist[idx];
+  if(!item)return;
   const el=document.createElement(item.type==='music'?'audio':'video');
   el.src=item.url;
   el.onloadedmetadata=()=>{item.duration=formatTime(el.duration);updateUI()};
@@ -510,9 +590,27 @@ function updateLibraryView(){
   empty.style.display='none';
   let html='';
   playlist.forEach((c,i)=>{
-    html+=`<div class="card" onclick="selectTrack(${i})"><div class="cover"><div class="color-cover ${c.color}">${c.icon}</div><div class="play-overlay">▶</div></div><div class="title">${c.name.split('.').slice(0,-1).join('.')||c.name}</div><div class="subtitle">${c.type==='music'?'Audio':'Video'} · ${c.duration}</div></div>`;
+    html+=`<div class="card" style="position:relative" onclick="selectTrack(${i})"><div class="cover"><div class="color-cover ${c.color}">${c.icon}</div><div class="play-overlay">▶</div></div><div class="title">${c.name.split('.').slice(0,-1).join('.')||c.name}</div><div class="subtitle">${c.type==='music'?'Audio':'Video'} · ${c.duration}</div><button onclick="event.stopPropagation();removeSavedTrack(${i})" style="position:absolute;top:8px;right:8px;background:rgba(0,0,0,.7);border:none;color:var(--red);width:28px;height:28px;border-radius:50%;cursor:pointer;font-size:14px;display:flex;align-items:center;justify-content:center;opacity:0;transition:.2s" onmouseover="this.style.opacity=1" onmouseout="this.style.opacity=0">✕</button></div>`;
   });
   grid.innerHTML=html;
+}
+
+async function removeSavedTrack(idx){
+  const item=playlist[idx];
+  if(item&&item.id){
+    await deleteTrack(item.id);
+  }
+  if(idx===currentIndex){
+    audioEl.pause();videoEl.pause();
+    currentIndex=-1;isPlaying=false;
+    updatePlayBtn();
+    document.getElementById('bpTitle').textContent='Sin reproducción';
+    document.getElementById('bpArtist').textContent='Agrega archivos para comenzar';
+    document.getElementById('bpCover').innerHTML='<div class="color-cover gc8" style="font-size:20px">🎵</div>';
+  }else if(idx<currentIndex){
+    currentIndex--;
+  }
+  await loadSavedTracks();
 }
 
 function selectTrack(idx){
@@ -662,7 +760,11 @@ function initAudioCtx(){
   prev.connect(analyser);analyser.connect(audioCtx.destination);
 }
 
-generatePlaylists();
+// Init
+(async()=>{
+  await openDB();
+  await loadSavedTracks();
+})();
 </script>
 </body>
 </html>
